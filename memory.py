@@ -1,68 +1,78 @@
-# memory.py
-import json
-import os
+"""
+memory.py — persists conversation history across sessions.
 
-MEMORY_FILE = "memory.json"
+Saves only genuine user questions and final assistant answers.
+Filters out:
+  - system and tool-response messages
+  - assistant messages that are intermediate tool-calling steps
+  - malformed Groq tool-call syntax embedded in assistant content
+  - exit/quit commands and their goodbye replies
+  - empty messages
+"""
+
+import json
+import config
+
+EXIT_COMMANDS = {"exit", "exit()", "quit", "quit()", "close", "bye", "q"}
+GOODBYE_REPLIES = {"goodbye!", "goodbye", "bye!", "bye"}
+
+
+def _extract(m) -> tuple[str | None, str, bool]:
+    """
+    Returns (role, content, has_tool_calls) from either:
+      - a plain dict  (user messages, injected tool results), or
+      - a ChatCompletionMessage SDK object  (LLM responses).
+    Returns (None, "", False) for unrecognised types.
+    """
+    if isinstance(m, dict):
+        return m.get("role"), m.get("content") or "", bool(m.get("tool_calls"))
+    if hasattr(m, "role"):
+        return m.role, m.content or "", bool(getattr(m, "tool_calls", None))
+    return None, "", False
+
 
 def load_memory() -> list:
-    """Load past messages from disk."""
-    if os.path.exists(MEMORY_FILE):
-        with open(MEMORY_FILE, "r") as f:
+    """Load past messages from disk. Returns an empty list if the file doesn't exist."""
+    try:
+        with open(config.MEMORY_FILE, "r") as f:
             return json.load(f)
-    return []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
 
-def _extract(m) -> tuple:
-    """Extract (role, content, has_tool_calls) from either a dict or a
-    ChatCompletionMessage object. Returns (None, None, False) for unknown types."""
-    if isinstance(m, dict):
-        role = m.get("role")
-        content = m.get("content") or ""
-        has_tool_calls = bool(m.get("tool_calls"))
-        return role, content, has_tool_calls
-    # OpenAI / Groq SDK object (ChatCompletionMessage)
-    if hasattr(m, "role"):
-        role = m.role
-        content = m.content or ""
-        has_tool_calls = bool(getattr(m, "tool_calls", None))
-        return role, content, has_tool_calls
-    return None, None, False
 
-def save_memory(messages: list):
-    """Save only genuine user questions and final assistant answers.
-    Filters out:
-    - system messages
-    - tool response messages
-    - assistant messages that contain tool_calls (intermediate steps)
-    - injected tool result lines and [called ...] markers
-    Handles both plain dicts and ChatCompletionMessage SDK objects.
+def save_memory(messages: list) -> None:
+    """
+    Filters the full message history down to storable Q&A pairs
+    and writes them to disk (capped at MEMORY_WINDOW messages).
     """
     storable = []
+
     for m in messages:
         role, content, has_tool_calls = _extract(m)
 
-        # Skip system messages, tool response messages, unknown types
+        # Keep only user and assistant turns
         if role not in ("user", "assistant"):
             continue
-        # Skip assistant messages that are intermediate tool-calling steps
+        # Skip intermediate assistant steps that are about to call a tool
         if role == "assistant" and has_tool_calls:
             continue
-        # Skip injected tool result messages (malformed tool call recovery)
-        if content.startswith("Tool result for"):
+        # Skip injected recovery messages (legacy plain-text format)
+        if content.startswith("Tool result for") or content.startswith("[called "):
             continue
-        # Skip placeholder assistant messages from malformed tool call recovery
-        if content.startswith("[called "):
-            continue
-        # Skip empty content
-        if not content.strip():
-            continue
-        # Skip assistant messages that contain malformed Groq tool-call syntax
-        # — storing these re-teaches the LLM the broken format on the next turn
+        # Skip malformed Groq tool-call syntax — re-injecting it teaches the LLM bad habits
         if role == "assistant" and "<function=" in content:
+            continue
+        # Skip exit commands and their paired goodbye replies
+        if role == "user" and content.lower().strip() in EXIT_COMMANDS:
+            continue
+        if role == "assistant" and content.strip().lower() in GOODBYE_REPLIES:
+            continue
+        # Skip empty turns
+        if not content.strip():
             continue
 
         storable.append({"role": role, "content": content})
 
-    # Keep only the last 10 genuine Q&A pairs (20 messages)
-    recent = storable[-20:]
-    with open(MEMORY_FILE, "w") as f:
+    recent = storable[-config.MEMORY_WINDOW:]
+    with open(config.MEMORY_FILE, "w") as f:
         json.dump(recent, f, indent=2)

@@ -1,123 +1,100 @@
+"""
+agent.py — the core agent loop.
+
+Responsibilities:
+  - Build the message history (system prompt + memory + user message)
+  - Call the LLM in a loop until it produces a final answer or hits MAX_ITERATIONS
+  - Execute tool calls and feed results back into the loop
+  - Recover from Groq/Llama malformed tool-call responses
+  - Persist memory after every successful response
+"""
+
 import json
 import re
-import os
-from openai import OpenAI, BadRequestError
-from dotenv import load_dotenv
-from tools import execute_code, summarize
-from database import query_database, get_db_schema
+import time
+import uuid
+
+from openai import OpenAI, BadRequestError, RateLimitError
+
+import config
+from tools import TOOLS, TOOL_FUNCTIONS
+from tools.database_tool import get_db_schema
 from memory import load_memory, save_memory
 
-load_dotenv()  # Load OPENAI_API_KEY from .env file
+
+# ── LLM client (lazy singleton) ───────────────────────────────────────────────
+_client: OpenAI | None = None
+
+def _get_client() -> OpenAI:
+    global _client
+    if _client is None:
+        _client = OpenAI(api_key=config.API_KEY, base_url=config.API_BASE_URL)
+    return _client
 
 
-client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"),
-    base_url=os.getenv("OPENAI_BASE_URL")  # None if not set, defaults to OpenAI
+# ── Malformed tool-call recovery ──────────────────────────────────────────────
+# Groq/Llama sometimes emits tool calls in a non-standard XML-like format
+# instead of proper JSON tool_calls. This helper parses and executes them.
+_MALFORMED_RE = re.compile(
+    r"<function=(\w+)[^{]*(\{.*?\})\s*>?\s*</function>",
+    re.DOTALL
 )
 
-# Map tool names → actual Python functions
-TOOL_FUNCTIONS = {
-    "execute_code": execute_code,
-    "summarize": summarize,
-    "query_database": query_database,
-}
-
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "execute_code",
-            "description": "Executes Python code and returns the output. Use for calculations, data processing, or any task that requires running code.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "code": {
-                        "type": "string",
-                        "description": "The Python code to execute."
-                    }
-                },
-                "required": ["code"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "summarize",
-            "description": "Summarizes a long piece of text. Use when the user asks for a summary or when you have a lot of text to condense.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "text": {
-                        "type": "string",
-                        "description": "The text to summarize."
-                    }
-                },
-                "required": ["text"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "query_database",
-            "description": "Runs a SQL query against the database. Use for any question about data stored in the DB.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "sql": {
-                        "type": "string",
-                        "description": "The SQL query to run (e.g. SELECT * FROM users WHERE age > 30)"
-                    }
-                },
-                "required": ["sql"]
-            }
-        }
-    }
-]
-
-def run_agent(user_message: str, memory: list = None) -> str:
+def _recover_malformed_call(failed_gen: str) -> tuple[str, str] | None:
     """
-    Runs the agent loop.
-    - user_message: the query from the user
-    - memory: optional list of prior messages (persistent memory)
-    Returns the final response string.
+    Tries to parse a malformed Groq tool call from `failed_gen`.
+    Returns (tool_name, json_args_string) on success, or None if unparseable.
     """
+    match = _MALFORMED_RE.search(failed_gen)
+    if not match:
+        return None
+    return match.group(1), match.group(2)
 
-    # Build the message history
+
+# ── Agent loop ────────────────────────────────────────────────────────────────
+def run_agent(user_message: str, memory: list | None = None) -> str:
+    """
+    Runs the ReAct-style agent loop for a single user query.
+
+    Args:
+        user_message: The current query from the user.
+        memory:       Optional list of prior {role, content} dicts (persistent memory).
+
+    Returns:
+        The agent's final plain-text answer.
+    """
     db_schema = get_db_schema()
-    messages = [
+
+    # Build the message history: system → memory → current user message
+    messages: list = [
         {
             "role": "system",
             "content": (
-                "You are a helpful AI assistant with tools. "
+                "You are a helpful AI assistant with access to tools. "
                 "You can run Python code, summarize text, and query a SQLite database. "
-                "Use tools when needed. When you have a final answer, just reply directly.\n\n"
-                "The database uses SQLite syntax. Here is the schema:\n"
+                "Only use tools when the task genuinely requires them — "
+                "do NOT use tools for conversational questions, definitions, or anything "
+                "you can answer directly from your own knowledge. "
+                "When you have a final answer, reply directly without calling any tool.\n\n"
+                "Database schema (SQLite):\n"
                 f"{db_schema}"
             )
         }
     ]
 
-    # Inject memory from previous sessions (if any)
     if memory:
         messages.extend(memory)
 
-    # Add the new user message
     messages.append({"role": "user", "content": user_message})
 
-    # ─── THE LOOP ───────────────────────────────────────
-    MAX_ITERATIONS = 10  # Safety limit to prevent infinite loops
-    iteration = 0
-
-    while iteration < MAX_ITERATIONS:
-        iteration += 1
+    # ── Loop ─────────────────────────────────────────────────────────────────
+    for iteration in range(1, config.MAX_ITERATIONS + 1):
         print(f"\n[Agent Loop - Iteration {iteration}]")
 
-        # Call the LLM
+        # ── LLM call ─────────────────────────────────────────────────────────
         try:
-            response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+            response = _get_client().chat.completions.create(
+                model=config.MODEL,
                 messages=messages,
                 tools=TOOLS,
                 tool_choice="auto"
@@ -125,71 +102,92 @@ def run_agent(user_message: str, memory: list = None) -> str:
             message = response.choices[0].message
             messages.append(message)
 
-        except BadRequestError as e:
-            # Groq/Llama sometimes generates malformed tool calls like:
-            # <function=tool_name {...}> </function>
-            # We parse it manually, run the tool, and continue the loop.
+        except RateLimitError as e:
             error_body = e.body or {}
-            failed_gen = error_body.get("failed_generation", "")
-            match = re.search(r"<function=(\w+)\s*(\{.*?\})\s*</function>", failed_gen, re.DOTALL)
-            if match:
-                tool_name = match.group(1)
-                tool_args = json.loads(match.group(2))
-                print(f"[Agent] Recovered malformed tool call: {tool_name}({tool_args})")
-                tool_result = TOOL_FUNCTIONS.get(tool_name, lambda **_: "Unknown tool")(**tool_args)
-                print(f"[Agent] Tool result: {str(tool_result)[:200]}...")
-                # Inject as a plain user message so the loop can continue
-                messages.append({"role": "assistant", "content": f"[called {tool_name}]"})
-                messages.append({"role": "user", "content": f"Tool result for {tool_name}: {tool_result}"})
-                continue
-            else:
+            error_msg  = error_body.get("error", {}).get("message", str(e))
+
+            # Daily limit exhausted — no point retrying, tell the user clearly.
+            if "tokens per day" in error_msg.lower() or "tpd" in error_msg.lower():
+                return (
+                    "Daily token limit reached on the Groq API. "
+                    "Please wait until tomorrow or upgrade your plan at "
+                    "https://console.groq.com/settings/billing"
+                )
+
+            # Per-minute / per-request limit — back off and retry.
+            wait = config.RATE_LIMIT_RETRY_WAIT
+            print(f"[Agent] Rate limit hit — retrying in {wait}s...")
+            time.sleep(wait)
+            continue  # retry this iteration
+
+        except BadRequestError as e:
+            # Groq sometimes generates malformed tool calls — try to recover.
+            failed_gen = (e.body or {}).get("failed_generation", "")
+            recovered  = _recover_malformed_call(failed_gen)
+
+            if not recovered:
                 return f"Agent error: {str(e)}"
 
-        # ─── TERMINATION CHECK ──────────────────────────
-        # If no tool calls → LLM is done, save memory and return final answer
+            tool_name, raw_args = recovered
+            # Groq sometimes escapes single quotes as \' inside the JSON blob,
+            # which is invalid JSON (only \" is a legal string escape).
+            # Strip them before parsing so json.loads doesn't crash.
+            try:
+                tool_args = json.loads(raw_args)
+            except json.JSONDecodeError:
+                tool_args = json.loads(raw_args.replace("\\'", "'"))
+            print(f"[Agent] Recovered malformed call → {tool_name}({tool_args})")
+
+            fn     = TOOL_FUNCTIONS.get(tool_name, lambda **_: f"Unknown tool: '{tool_name}'")
+            result = fn(**tool_args)
+            print(f"[Agent] Tool result: {str(result)[:200]}...")
+
+            # Inject using the proper tool-call message structure so the LLM
+            # sees: assistant (decided to call tool) → tool (result).
+            # Using fake user/assistant text here confuses the model into
+            # thinking it hasn't answered yet, causing duplicate tool calls.
+            fake_call_id = f"recovered_{uuid.uuid4().hex[:8]}"
+            messages.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id":       fake_call_id,
+                    "type":     "function",
+                    "function": {
+                        "name":      tool_name,
+                        "arguments": raw_args,
+                    }
+                }]
+            })
+            messages.append({
+                "role":         "tool",
+                "tool_call_id": fake_call_id,
+                "content":      str(result),
+            })
+            continue
+
+        # ── Termination check ─────────────────────────────────────────────────
         if not message.tool_calls:
             print("[Agent] Done — returning final answer.")
             save_memory(messages)
             return message.content
 
-        # ─── TOOL EXECUTION ─────────────────────────────
-        # The LLM wants to call one or more tools
+        # ── Tool execution ────────────────────────────────────────────────────
         for tool_call in message.tool_calls:
             tool_name = tool_call.function.name
             tool_args = json.loads(tool_call.function.arguments)
 
             print(f"[Agent] Calling tool: {tool_name} with args: {tool_args}")
 
-            # Run the actual Python function
-            if tool_name in TOOL_FUNCTIONS:
-                tool_result = TOOL_FUNCTIONS[tool_name](**tool_args)
-            else:
-                tool_result = f"Error: Unknown tool '{tool_name}'"
+            fn     = TOOL_FUNCTIONS.get(tool_name, lambda **_: f"Unknown tool: '{tool_name}'")
+            result = fn(**tool_args)
 
-            print(f"[Agent] Tool result: {tool_result[:200]}...")  # Preview
+            print(f"[Agent] Tool result: {str(result)[:200]}...")
 
-            # Feed the result back into the message history
             messages.append({
-                "role": "tool",
+                "role":         "tool",
                 "tool_call_id": tool_call.id,
-                "content": str(tool_result)
+                "content":      str(result)
             })
 
-    # If we hit the iteration limit, return whatever we have
-    return "Agent reached maximum iterations without a final answer."
-
-
-# ─── MAIN ENTRY POINT ────────────────────────────────────
-if __name__ == "__main__":
-    print("Agent is ready. Type 'quit' to exit.\n")
-    while True:
-        user_input = input("You: ").strip()
-
-        if user_input.lower() in ("quit", "exit"):
-            break
-
-        memory = load_memory()
-        answer = run_agent(user_input, memory=memory)
-        print(f"\nAgent: {answer}\n")
-        
-        
+    return "Agent reached the maximum number of iterations without a final answer."
