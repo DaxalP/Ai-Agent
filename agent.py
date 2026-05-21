@@ -1,11 +1,19 @@
 import json
-from openai import OpenAI
+import re
+import os
+from openai import OpenAI, BadRequestError
+from dotenv import load_dotenv
 from tools import execute_code, summarize
-from database import query_database
+from database import query_database, get_db_schema
 from memory import load_memory, save_memory
 
+load_dotenv()  # Load OPENAI_API_KEY from .env file
 
-client = OpenAI()
+
+client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    base_url=os.getenv("OPENAI_BASE_URL")  # None if not set, defaults to OpenAI
+)
 
 # Map tool names → actual Python functions
 TOOL_FUNCTIONS = {
@@ -77,13 +85,16 @@ def run_agent(user_message: str, memory: list = None) -> str:
     """
 
     # Build the message history
+    db_schema = get_db_schema()
     messages = [
         {
             "role": "system",
             "content": (
                 "You are a helpful AI assistant with tools. "
-                "You can run Python code, summarize text, and query a database. "
-                "Use tools when needed. When you have a final answer, just reply directly."
+                "You can run Python code, summarize text, and query a SQLite database. "
+                "Use tools when needed. When you have a final answer, just reply directly.\n\n"
+                "The database uses SQLite syntax. Here is the schema:\n"
+                f"{db_schema}"
             )
         }
     ]
@@ -104,17 +115,35 @@ def run_agent(user_message: str, memory: list = None) -> str:
         print(f"\n[Agent Loop - Iteration {iteration}]")
 
         # Call the LLM
-        response = client.chat.completions.create(
-            model="gpt-4",
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto"  # Let the LLM decide: use a tool or answer directly
-        )
+        try:
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=messages,
+                tools=TOOLS,
+                tool_choice="auto"
+            )
+            message = response.choices[0].message
+            messages.append(message)
 
-        message = response.choices[0].message
-
-        # Add the LLM's response to the message history
-        messages.append(message)
+        except BadRequestError as e:
+            # Groq/Llama sometimes generates malformed tool calls like:
+            # <function=tool_name {...}> </function>
+            # We parse it manually, run the tool, and continue the loop.
+            error_body = e.body or {}
+            failed_gen = error_body.get("failed_generation", "")
+            match = re.search(r"<function=(\w+)\s*(\{.*?\})\s*</function>", failed_gen, re.DOTALL)
+            if match:
+                tool_name = match.group(1)
+                tool_args = json.loads(match.group(2))
+                print(f"[Agent] Recovered malformed tool call: {tool_name}({tool_args})")
+                tool_result = TOOL_FUNCTIONS.get(tool_name, lambda **_: "Unknown tool")(**tool_args)
+                print(f"[Agent] Tool result: {str(tool_result)[:200]}...")
+                # Inject as a plain user message so the loop can continue
+                messages.append({"role": "assistant", "content": f"[called {tool_name}]"})
+                messages.append({"role": "user", "content": f"Tool result for {tool_name}: {tool_result}"})
+                continue
+            else:
+                return f"Agent error: {str(e)}"
 
         # ─── TERMINATION CHECK ──────────────────────────
         # If no tool calls → LLM is done, save memory and return final answer
@@ -146,8 +175,7 @@ def run_agent(user_message: str, memory: list = None) -> str:
                 "content": str(tool_result)
             })
 
-    # If we hit the iteration limit, save memory and return whatever we have
-    save_memory(messages)
+    # If we hit the iteration limit, return whatever we have
     return "Agent reached maximum iterations without a final answer."
 
 

@@ -30,3 +30,23 @@ def query_database(sql: str) -> str:
 
     except Exception as e:
         return f"Database error: {str(e)}"
+
+
+def get_db_schema() -> str:
+    """Returns the SQLite database schema so the LLM knows what tables and columns exist."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = cursor.fetchall()
+        schema = ""
+        for (table,) in tables:
+            cursor.execute(f"PRAGMA table_info({table})")
+            columns = cursor.fetchall()
+            schema += f"\nTable: {table}\n"
+            for col in columns:
+                schema += f"  - {col[1]} ({col[2]})\n"
+        conn.close()
+        return schema if schema else "No tables found."
+    except Exception as e:
+        return f"Schema error: {str(e)}"

@@ -1,8 +1,14 @@
 import subprocess
 import sys
+import os
 from openai import OpenAI
+from dotenv import load_dotenv
 
-client = OpenAI()  # uses OPENAI_API_KEY env variable
+load_dotenv()  # Ensure .env is loaded before initializing the client
+client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    base_url=os.getenv("OPENAI_BASE_URL")
+)
 
 
 def execute_code(code: str) -> str:
@@ -27,7 +33,7 @@ def execute_code(code: str) -> str:
 def summarize(text: str) -> str:
     """Summarizes a long piece of text using GPT-4."""
     response = client.chat.completions.create(
-        model="gpt-4",
+        model="llama-3.3-70b-versatile",
         messages=[
             {"role": "system", "content": "Summarize the following text concisely."},
             {"role": "user", "content": text}
