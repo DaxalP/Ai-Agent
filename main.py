@@ -1,10 +1,3 @@
-"""
-main.py — CLI entry point for the agent.
-
-Run with:
-    python main.py
-"""
-
 from agent import run_agent
 from memory import load_memory
 

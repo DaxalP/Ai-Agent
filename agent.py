@@ -1,14 +1,3 @@
-"""
-agent.py — the core agent loop.
-
-Responsibilities:
-  - Build the message history (system prompt + memory + user message)
-  - Call the LLM in a loop until it produces a final answer or hits MAX_ITERATIONS
-  - Execute tool calls and feed results back into the loop
-  - Recover from Groq/Llama malformed tool-call responses
-  - Persist memory after every successful response
-"""
-
 import json
 import re
 import time
